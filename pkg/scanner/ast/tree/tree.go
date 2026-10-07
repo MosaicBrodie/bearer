@@ -163,7 +163,7 @@ func (node *Node) QueryResults(queryID int) []QueryResult {
 	}
 
 	results := node.queryResults[queryID]
-	if len(results) == 0 {
+	if len(results) == 0 && log.Trace().Enabled() {
 		// Log available query IDs for debugging
 		availableIDs := make([]int, 0, len(node.queryResults))
 		for id := range node.queryResults {

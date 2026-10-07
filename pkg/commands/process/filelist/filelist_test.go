@@ -89,11 +89,15 @@ func TestFileList(t *testing.T) {
 				Files: []files.File{
 					{
 						Timeout:  0,
+						FilePath: "users/minifiedJs.min.js",
+					},
+					{
+						Timeout:  0,
 						FilePath: "users/users.go",
 					},
 				},
 				Coverage: coverage.Discovery{
-					Files:    []string{"users/users.go"},
+					Files:    []string{"users/minifiedJs.min.js", "users/users.go"},
 					Excluded: []coverage.Exclusion{{Path: "users/admin.go", Reason: "skip-path"}},
 					Errors:   []string{},
 					Complete: true,
@@ -247,6 +251,51 @@ func TestDiscoverLanguageFilter(t *testing.T) {
 	})
 }
 
+func TestDiscoverUsesFixedMaximumInputSize(t *testing.T) {
+	dir := t.TempDir()
+	for name, size := range map[string]int64{
+		"at-limit.dat":   int64(fileutil.MaxPromisedInputFileSize),
+		"over-limit.dat": int64(fileutil.MaxPromisedInputFileSize) + 1,
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(path, size); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, configuredMaximum := range []int{0, fileutil.MaxPromisedInputFileSize * 2} {
+		list, err := filelist.Discover(nil, dir, &gocloc.Result{Files: map[string]*gocloc.ClocFile{}}, settings.Config{
+			Scan: flagtypes.ScanOptions{SkipGitIgnore: true},
+			Worker: settings.WorkerOptions{
+				FileSizeMaximum:           configuredMaximum,
+				TimeoutFileBytesPerSecond: 1,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert.Contains(t, list.Coverage.Files, "at-limit.dat")
+		assert.NotContains(t, list.Coverage.Files, "over-limit.dat")
+		assert.Contains(t, list.Coverage.Excluded, coverage.Exclusion{Path: "over-limit.dat", Reason: "file-size"})
+	}
+
+	visited := false
+	err := fileutil.IterateFilesListWithExclusions(
+		dir,
+		[]string{"over-limit.dat"},
+		false,
+		true,
+		func(*fileutil.Path) (bool, error) { return true, nil },
+		func(*fileutil.FileInfo) error { visited = true; return nil },
+		nil,
+	)
+	assert.Error(t, err)
+	assert.False(t, visited)
+}
+
 func TestCoverageDiscoveryRecordsExclusions(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, "skip"), 0o700); err != nil {
@@ -277,10 +326,14 @@ func TestCoverageDiscoverConfiguredEligibilityMatchesProcessingRules(t *testing.
 	dir := t.TempDir()
 	files := map[string][]byte{
 		"keep.go":          []byte("package keep\n"),
-		"tests/fixture.go": []byte("package fixture\n"),
 		"fixtures/data.go": []byte("package fixture\n"),
+		"tests/fixture.go": []byte("package test\n"),
+		"bundle.min.js":    []byte("const bundle = true;\n"),
 		"binary.dat":       []byte{'b', 0, 'i', 'n', 'a', 'r', 'y'},
 		"image.png":        []byte("not really an image"),
+		"archive.tar":      []byte("archive bytes"),
+		"font.woff":        []byte("font bytes"),
+		"notes.md":         []byte("evidence notes\n"),
 		"gitignored.go":    []byte("package ignored\n"),
 		".gitignore":       []byte("gitignored.go\n"),
 	}
@@ -295,7 +348,7 @@ func TestCoverageDiscoverConfiguredEligibilityMatchesProcessingRules(t *testing.
 	}
 
 	config := settings.Config{
-		Scan: flagtypes.ScanOptions{SkipTest: true},
+		Scan: flagtypes.ScanOptions{SkipGitIgnore: true},
 		Worker: settings.WorkerOptions{
 			FileSizeMaximum:           100000,
 			TimeoutFileBytesPerSecond: 1,
@@ -303,19 +356,44 @@ func TestCoverageDiscoverConfiguredEligibilityMatchesProcessingRules(t *testing.
 	}
 	list, err := filelist.Discover(nil, dir, &gocloc.Result{Files: map[string]*gocloc.ClocFile{}}, config)
 	assert.NoError(t, err)
-	assert.ElementsMatch(t, []string{".gitignore", "keep.go"}, coverageFiles(list))
-	assert.ElementsMatch(t, []coverage.Exclusion{
-		{Path: "binary.dat", Reason: "file-type-or-gitignore"},
-		{Path: "fixtures", Reason: "built-in-path"},
-		{Path: "gitignored.go", Reason: "file-type-or-gitignore"},
-		{Path: "image.png", Reason: "file-type-or-gitignore"},
-		{Path: "tests", Reason: "test-name"},
-	}, list.Coverage.Excluded)
+	assert.ElementsMatch(t, []string{
+		".gitignore", "archive.tar", "binary.dat", "bundle.min.js", "fixtures/data.go", "font.woff",
+		"gitignored.go", "image.png", "keep.go", "notes.md", "tests/fixture.go",
+	}, coverageFiles(list))
+	assert.Empty(t, list.Coverage.Excluded)
 
-	config.Scan.SkipGitIgnore = true
+	visited := make([]string, 0, len(list.Coverage.Files))
+	err = fileutil.IterateFilesListWithExclusions(
+		dir,
+		list.Coverage.Files,
+		false,
+		true,
+		func(*fileutil.Path) (bool, error) { return true, nil },
+		func(info *fileutil.FileInfo) error {
+			visited = append(visited, info.RelativePath)
+			return nil
+		},
+		func(reason string) { t.Errorf("scheduled ordinary input was excluded during processing: %s", reason) },
+	)
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, list.Coverage.Files, visited)
+
+	config.Scan.SkipTest = true
+	config.Scan.SkipPath = []string{"fixtures"}
 	list, err = filelist.Discover(nil, dir, &gocloc.Result{Files: map[string]*gocloc.ClocFile{}}, config)
 	assert.NoError(t, err)
-	assert.Contains(t, coverageFiles(list), "gitignored.go")
+	assert.NotContains(t, coverageFiles(list), "fixtures/data.go")
+	assert.NotContains(t, coverageFiles(list), "tests/fixture.go")
+	assert.Contains(t, list.Coverage.Excluded, coverage.Exclusion{Path: "fixtures", Reason: "skip-path"})
+	assert.Contains(t, list.Coverage.Excluded, coverage.Exclusion{Path: "tests", Reason: "test-name"})
+
+	config.Scan.SkipTest = false
+	config.Scan.SkipPath = nil
+	config.Scan.SkipGitIgnore = false
+	list, err = filelist.Discover(nil, dir, &gocloc.Result{Files: map[string]*gocloc.ClocFile{}}, config)
+	assert.NoError(t, err)
+	assert.NotContains(t, coverageFiles(list), "gitignored.go")
+	assert.Contains(t, list.Coverage.Excluded, coverage.Exclusion{Path: "gitignored.go", Reason: "file-type-or-gitignore"})
 }
 
 func coverageFiles(list *files.List) []string {
@@ -349,14 +427,14 @@ func TestCoverageEligibilityKeepsExternalPromise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Files) != 1 || list.Files[0].FilePath != "keep.go" || len(list.Coverage.Excluded) != 1 {
+	if len(list.Files) != 2 || len(list.Coverage.Excluded) != 0 {
 		t.Fatalf("schedule/exclusions=%+v", list)
 	}
 	visited := []string{}
-	if err := fileutil.IterateFilesListWithExclusions(dir, []string{list.Files[0].FilePath}, false, true, func(*fileutil.Path) (bool, error) { return true, nil }, func(f *fileutil.FileInfo) error { visited = append(visited, f.RelativePath); return nil }, func(string) { t.Fatal("scheduled input excluded during processing") }); err != nil {
+	if err := fileutil.IterateFilesListWithExclusions(dir, list.Coverage.Files, false, true, func(*fileutil.Path) (bool, error) { return true, nil }, func(f *fileutil.FileInfo) error { visited = append(visited, f.RelativePath); return nil }, func(string) { t.Fatal("scheduled input excluded during processing") }); err != nil {
 		t.Fatal(err)
 	}
-	if len(visited) != 1 || visited[0] != "keep.go" {
+	if len(visited) != 2 || visited[0] != "binary.dat" || visited[1] != "keep.go" {
 		t.Fatalf("visits=%v", visited)
 	}
 	record := coverage.Record{Schema: coverage.Schema, RunID: coverage.Digest([]byte("run")), ConfigurationSHA256: coverage.Digest(nil), Discovery: list.Coverage, Outcomes: []coverage.Outcome{{Path: "keep.go", SHA256: coverage.Digest(keep), Status: "success"}}, Complete: true}

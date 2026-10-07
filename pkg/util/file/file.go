@@ -22,6 +22,9 @@ import (
 
 const guessByteCount = 16 * 1024
 
+// MaxPromisedInputFileSize is the fixed per-file boundary for complete-input scans.
+const MaxPromisedInputFileSize = 32 * 1024 * 1024
+
 type Line struct {
 	Extract    string
 	LineNumber int
@@ -89,7 +92,7 @@ func (path *Path) Join(elements ...string) *Path {
 }
 
 func (fileInfo *FileInfo) isGlobalIgnored() bool {
-	return fileInfo.isBinary || fileInfo.isGitIgnored || fileInfo.isImage
+	return fileInfo.isGitIgnored
 }
 
 func (fileInfo *FileInfo) LanguageTypeString() string {
@@ -144,6 +147,9 @@ func ConfiguredExclusion(rootDir, filename string, skipTest, skipGitIgnore bool)
 	if info.IsDir() {
 		return configuredPathExclusion(relative+"/", skipTest), nil
 	}
+	if info.Size() > MaxPromisedInputFileSize {
+		return "file-size", nil
+	}
 	bound, err := scope.Acquire(filename, nil)
 	if err != nil {
 		return "", err
@@ -173,9 +179,6 @@ func ConfiguredExclusion(rootDir, filename string, skipTest, skipGitIgnore bool)
 }
 
 func configuredPathExclusion(relativePath string, skipTest bool) string {
-	if regex.AnyMatch(IgnoredFilenames, relativePath) {
-		return "built-in-path"
-	}
 	if skipTest && regex.AnyMatch(ignoreTestFiles, relativePath) {
 		return "test-name"
 	}
@@ -248,6 +251,13 @@ func IterateFilesListWithInput(rootDir string, files []string, skipTest, skipGit
 	// Reuse the acquisition below rather than validating by a pathname check.
 	var expectedInput *BoundInput
 	if expectation != nil {
+		info, err := scope.statRelative(files[0])
+		if err != nil {
+			return err
+		}
+		if info.Size() > MaxPromisedInputFileSize {
+			return fmt.Errorf("input exceeds fixed %d-byte limit: %s", MaxPromisedInputFileSize, files[0])
+		}
 		expectedInput, err = scope.Acquire(files[0], expectation)
 		if err != nil {
 			return err
@@ -268,10 +278,20 @@ func IterateFilesListWithInput(rootDir string, files []string, skipTest, skipGit
 	for _, relative := range files {
 		bound := expectedInput
 		if bound == nil {
+			info, statErr := scope.statRelative(relative)
+			if statErr != nil {
+				return statErr
+			}
+			if info.Size() > MaxPromisedInputFileSize {
+				return fmt.Errorf("input exceeds fixed %d-byte limit: %s", MaxPromisedInputFileSize, relative)
+			}
 			bound, err = scope.Acquire(relative, nil)
 			if err != nil {
 				return err
 			}
+		}
+		if bound.Info().Size() > MaxPromisedInputFileSize {
+			return fmt.Errorf("input exceeds fixed %d-byte limit: %s", MaxPromisedInputFileSize, relative)
 		}
 		eligibility, err := scope.selector(relative)
 		if err != nil {

@@ -11,7 +11,7 @@ import (
 
 const (
 	minNodeCount = 20_000 // minimum number of AST nodes for cache to be enabled
-	maxCacheSize = 1000   // maximum number of AST nodes per cache/shared-cache
+	maxCacheSize = 65_536 // maximum number of AST nodes per cache/shared-cache
 	evictionSize = 100    // number of AST nodes to evict when max is reached
 )
 
@@ -96,7 +96,6 @@ func (cache *Cache) Put(node *treepkg.Node, rule *ruleset.Rule, result *detector
 				break
 			}
 
-			data[evictedNode] = nil
 			delete(data, evictedNode)
 
 			i++

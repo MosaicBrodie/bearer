@@ -13,20 +13,23 @@ import (
 	globaltypes "github.com/bearer/bearer/pkg/types"
 )
 
+// Qualified Mosaic complete-input policy; not a caller/environment override.
+const FileSizeMaximum = inputfile.MaxPromisedInputFileSize
+
 var (
-	Timeout                          = 30 * time.Minute  // "The maximum time alloted to complete the scan
-	TimeoutFileMinimum               = 5 * time.Second   // Minimum timeout assigned for scanning each file. This config superseeds timeout-second-per-bytes
-	TimeoutFileMaximum               = 30 * time.Second  // Maximum timeout assigned for scanning each file. This config superseeds timeout-second-per-bytes
-	TimeoutFileBytesPerSecond        = 1 * 1000          // 1 Kb/s minimum number of bytes per second allowed to scan a file
-	TimeoutWorkerFileGrace           = 5 * time.Second   // Grace period to allow a worker to timeout on it's own
-	TimeoutWorkerOnline              = 60 * time.Second  // Maximum time to wait for a worker process to come online
-	TimeoutWorkerShutdown            = 5 * time.Second   // Maximum time to wait for a worker process to shut down cleanly
-	CodeExtractBuffer                = 3                 // Number of lines allowed before or after the detection
-	FileSizeMaximum                  = 2 * 1000 * 1000   // 2 MB Ignore files larger than the specified value
-	FilesPerWorker                   = 1000              // By default, start a worker per this many files, up to the number of CPUs
-	MemorySoftMaximum         uint64 = 650 * 1000 * 1000 // 650 MB If the memory needed to scan a file surpasses the specified limit, ask the worker to reduce memory usage.
-	MemoryMaximum             uint64 = 800 * 1000 * 1000 // 800 MB If the memory needed to scan a file surpasses the specified limit, skip the file.
-	ExistingWorker                   = ""                // Specify the URL of an existing worker
+	Timeout                   = 60 * time.Minute  // "The maximum time alloted to complete the scan
+	TimeoutFileMinimum        = 150 * time.Second // Minimum timeout assigned for scanning each file.
+	TimeoutFileMaximum        = 810 * time.Second // Maximum timeout assigned for scanning each file.
+	TimeoutFileBytesPerSecond = 250               // File-size-derived timeout rate in bytes per second.
+	TimeoutWorkerFileGrace    = 5 * time.Second   // Grace period to allow a worker to timeout on it's own
+	TimeoutWorkerOnline       = 60 * time.Second  // Maximum time to wait for a worker process to come online
+	TimeoutWorkerShutdown     = 5 * time.Second   // Maximum time to wait for a worker process to shut down cleanly
+	CodeExtractBuffer         = 3                 // Number of lines allowed before or after the detection
+	// FileSizeMaximum is the fixed complete-input discovery boundary below.
+	FilesPerWorker           = 1000    // By default, start a worker per this many files, up to the number of CPUs
+	MemorySoftMaximum uint64 = 1 << 30 // 1 GiB; above this, ask the worker to reduce memory usage.
+	MemoryMaximum     uint64 = 5 << 28 // 1.25 GiB; above this, skip the file.
+	ExistingWorker           = ""      // Specify the URL of an existing worker
 )
 
 type WorkerOptions struct {

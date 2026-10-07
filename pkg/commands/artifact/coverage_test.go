@@ -587,6 +587,11 @@ func TestCoverageUnavailableRepresentations(t *testing.T) {
 				if mode != "cached" {
 					r.reuseDetection = false
 					r.discovery = d
+					scope, e := inputfile.OpenInputScope(r.targetPath)
+					if e != nil {
+						t.Fatal(e)
+					}
+					r.scanSettings.ReportInputs = scope
 				}
 				if mode == "diff" {
 					r.scanSettings.Scan.Diff = true
@@ -714,14 +719,8 @@ func TestCoverageDiffEligibilitySeparateTrees(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if baseBinary {
-				if len(e.calls) != 1 || len(e.calls[0]) != 1 || len(inputs) != 1 {
-					t.Fatalf("base exclusion suppressed eligible head: calls=%v inputs=%v", e.calls, inputs)
-				}
-			} else {
-				if len(e.calls) != 2 || len(e.calls[0]) != 1 || len(e.calls[1]) != 0 || len(inputs) != 0 {
-					t.Fatalf("head exclusion suppressed eligible base or was processed: calls=%v inputs=%v", e.calls, inputs)
-				}
+			if len(e.calls) != 2 || !reflect.DeepEqual(e.calls[0], []string{"input.go:" + baseContent}) || !reflect.DeepEqual(e.calls[1], []string{"input.go:" + headContent}) || len(inputs) != 1 || inputs[0].FilePath != "input.go" {
+				t.Fatalf("separate base/head inputs were not both eligible: calls=%v inputs=%v", e.calls, inputs)
 			}
 			if git("", "rev-parse", "HEAD") != head {
 				t.Fatal("head not restored")
@@ -853,12 +852,22 @@ func TestCoverageCheckpointBoundRepresentations(t *testing.T) {
 					r.reuseDetection = false
 					r.discovery = d
 					r.discovery.Excluded = []coverage.Exclusion{{Path: "excluded.log", Reason: "built-in-path"}}
+					scope := openArtifactContextFixture(t, r.targetPath, "input.go", nil)
+					appendArtifactContextFixture(t, r.reportPath, scope, "input.go")
+					r.scanSettings.ReportInputs = scope
 				}
 				if state == "diff" {
 					r.scanSettings.Scan.Diff = true
 					r.gitContext.BaseCommitHash = "synthetic-base"
 					r.discovery = coverage.Discovery{Files: []string{}, Excluded: []coverage.Exclusion{}, Errors: []string{"git diff discovery does not expose a supported same-run terminal file inventory"}}
 				}
+				// The fixture receipt is part of the source report input. Compare
+				// Report against that complete, validated fixture below.
+				fixtureReport, err := os.ReadFile(r.reportPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body = string(fixtureReport)
 				before, err := os.Stat(r.reportPath)
 				if err != nil {
 					t.Fatal(err)
@@ -969,6 +978,7 @@ policy_failure := [{"filename":%q,"full_filename":"/unsafe/ignored","line_number
 			if err := os.WriteFile(reportPath, append(append(names, '\n'), append(b, '\n')...), 0600); err != nil {
 				t.Fatal(err)
 			}
+			appendArtifactContextFixture(t, reportPath, scope, name)
 			r := &runner{targetPath: target, reportPath: reportPath, scanSettings: cfg, discovery: record.Discovery}
 			switch mode {
 			case "replacement":

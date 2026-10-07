@@ -26,20 +26,70 @@ import (
 )
 
 type fakeWorker struct {
-	scan func(work.ProcessRequest) error
+	scan        func(work.ProcessRequest) error
+	omitContext bool
 }
 
-func (f *fakeWorker) Scan(r work.ProcessRequest) error { return f.scan(r) }
-func (f *fakeWorker) Close()                           {}
+func (f *fakeWorker) Scan(r work.ProcessRequest) error {
+	if err := f.scan(r); err != nil {
+		return err
+	}
+	if f.omitContext {
+		return nil
+	}
+	body, err := os.ReadFile(r.ReportPath)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(body, []byte(`"type":"input_context"`)) {
+		return nil
+	}
+	// Synthetic workers still obtain receipts through the source-owned scope API.
+	scope, err := file.OpenInputScope(r.Repository.Dir)
+	if err != nil {
+		return err
+	}
+	bound, err := scope.Acquire(r.File.FilePath, r.InputExpectation)
+	if err != nil {
+		_ = scope.Close()
+		return err
+	}
+	expectation := bound.Expectation()
+	if err = bound.Close(); err != nil {
+		_ = scope.Close()
+		return err
+	}
+	receipt, err := scope.ContextReceipt(expectation)
+	closeErr := scope.Close()
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	output, err := os.OpenFile(r.ReportPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	writeErr := coverage.WriteFull(output, append(encoded, '\n'))
+	return errors.Join(writeErr, output.Close())
+}
+func (f *fakeWorker) Close() {}
 func syntheticOrchestrator(t *testing.T, fn func(work.ProcessRequest) error) *Orchestrator {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "input.go"), []byte("synthetic"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	scope, err := file.OpenInputScope(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = scope.Close() })
 	cfg := &settings.Config{}
 	cfg.Scan.Quiet = true
-	return &Orchestrator{repository: work.Repository{Dir: dir}, config: cfg, maxWorkersSemaphore: make(chan struct{}, 1), done: make(chan struct{}), pool: &fakeWorker{fn}}
+	return &Orchestrator{repository: work.Repository{Dir: dir}, config: cfg, maxWorkersSemaphore: make(chan struct{}, 1), done: make(chan struct{}), pool: &fakeWorker{scan: fn}, inputScope: scope}
 }
 func TestCoverageWorkerTerminal(t *testing.T) {
 	for _, c := range []struct {
@@ -118,7 +168,7 @@ func TestCoverageWorkerReportFailure(t *testing.T) {
 	if out := o.scanFile(failedWriter{}, files.File{FilePath: "input.go"}); out.Status == "success" {
 		t.Fatal("result write error accepted")
 	}
-	o.pool = &fakeWorker{func(work.ProcessRequest) error { return errors.New("timeout") }}
+	o.pool = &fakeWorker{scan: func(work.ProcessRequest) error { return errors.New("timeout") }}
 	if out := o.scanFile(failedWriter{}, files.File{FilePath: "input.go"}); out.Status == "success" || !strings.Contains(out.Error, "write failure") {
 		t.Fatalf("error write lost: %+v", out)
 	}
@@ -126,7 +176,7 @@ func TestCoverageWorkerReportFailure(t *testing.T) {
 
 func TestCoverageCancellationDuringWorker(t *testing.T) {
 	o := syntheticOrchestrator(t, func(work.ProcessRequest) error { return nil })
-	o.pool = &fakeWorker{func(r work.ProcessRequest) error { o.Close(); return os.WriteFile(r.ReportPath, nil, 0600) }}
+	o.pool = &fakeWorker{scan: func(r work.ProcessRequest) error { o.Close(); return os.WriteFile(r.ReportPath, nil, 0600) }}
 	if err := o.Scan(filepath.Join(t.TempDir(), "report.jsonl"), []files.File{{FilePath: "input.go"}}); err == nil {
 		t.Fatal("cancelled worker accepted")
 	}
@@ -264,8 +314,17 @@ func TestCoverageResidualEligibilityPromise(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(list.Files) != 1 || list.Files[0].FilePath != "input.go" {
-				t.Fatalf("compatible scheduling failed: %+v", list)
+			isExcluded := tc.skipTest || tc.gitIgnore
+			wantScheduled := 2
+			if isExcluded {
+				wantScheduled = 1
+			}
+			scheduled := map[string]bool{}
+			for _, candidate := range list.Files {
+				scheduled[candidate.FilePath] = true
+			}
+			if len(list.Files) != wantScheduled || !scheduled["input.go"] {
+				t.Fatalf("complete discovery scheduling failed: %+v", list.Files)
 			}
 			excluded := false
 			for _, x := range list.Coverage.Excluded {
@@ -273,8 +332,11 @@ func TestCoverageResidualEligibilityPromise(t *testing.T) {
 					excluded = true
 				}
 			}
-			if !excluded {
-				t.Fatal("exclusion lost")
+			if excluded != isExcluded {
+				t.Fatalf("discovery exclusion=%v, expected=%v: %+v", excluded, isExcluded, list.Coverage.Excluded)
+			}
+			if !isExcluded && !scheduled[tc.path] {
+				t.Fatalf("eligible built-in/binary input did not participate: %+v", list.Files)
 			}
 			calls := 0
 			newOrchestrator := func() *Orchestrator {
@@ -293,26 +355,34 @@ func TestCoverageResidualEligibilityPromise(t *testing.T) {
 				t.Fatalf("ordinary findings path failed: %v", err)
 			}
 			terminal := reviewTerminal(t, output)
-			if calls != 1 || len(terminal.Outcomes) != 1 || terminal.Outcomes[0].Path != "input.go" || terminal.Outcomes[0].Status != "success" {
+			outcomes := map[string]string{}
+			for _, outcome := range terminal.Outcomes {
+				outcomes[outcome.Path] = outcome.Status
+			}
+			if calls != wantScheduled || len(terminal.Outcomes) != wantScheduled || outcomes["input.go"] != "success" || (!isExcluded && outcomes[tc.path] != "success") {
 				t.Fatalf("visitation/outcomes: %d %+v", calls, terminal)
 			}
-			if err := terminal.ValidateInputs(fixed); err == nil {
-				t.Fatal("excluded promise was incorrectly certified")
+			if err := terminal.ValidateInputs(fixed); (err == nil) != !isExcluded {
+				t.Fatalf("fixed complete promise reconciliation: excluded=%v error=%v", isExcluded, err)
 			}
-			// An input already scheduled independently may not become success if later
-			// processing excludes it. Keep the fixed promise and inject that schedule.
+			// A fixed promise naming an explicitly test/gitignore-excluded input must
+			// still fail; eligible built-in/binary inputs must finish normally.
 			output = filepath.Join(t.TempDir(), "fixed.jsonl")
 			calls = 0
 			err = newOrchestrator().Scan(output, []files.File{{FilePath: "input.go", Timeout: time.Second}, {FilePath: tc.path, Timeout: time.Second}})
-			if err == nil || calls != 1 {
-				t.Fatalf("unvisited scheduled input accepted: calls=%d err=%v", calls, err)
+			if isExcluded {
+				if err == nil || calls != 1 {
+					t.Fatalf("explicit excluded promise accepted: calls=%d err=%v", calls, err)
+				}
+			} else if err != nil || calls != 2 {
+				t.Fatalf("eligible fixed schedule rejected: calls=%d err=%v", calls, err)
 			}
 			raw, err := os.ReadFile(output)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bytes.Contains(raw, []byte(`"type":"processing_coverage"`)) {
-				t.Fatal("failed fixed schedule emitted complete terminal")
+			if bytes.Contains(raw, []byte(`"type":"processing_coverage"`)) != !isExcluded {
+				t.Fatalf("fixed schedule terminal presence disagrees with exclusion=%v", isExcluded)
 			}
 			if len(fixed) != 2 || fixed[tc.path] != coverage.Digest([]byte(tc.body)) {
 				t.Fatal("external promise mutated")
@@ -408,7 +478,7 @@ func TestCoverageCheckpointOutsideTargetFilenameRejected(t *testing.T) {
 	}
 	visited := false
 	err := file.IterateFilesListWithExclusions(root, []string{"../outside.go"}, false, true, func(*file.Path) (bool, error) { return true, nil }, func(*file.FileInfo) error { visited = true; return nil }, nil)
-	if err == nil || !strings.Contains(err.Error(), "input outside target") || visited {
+	if err == nil || err.Error() != "metadata outside target\nmetadata outside target" || visited {
 		t.Fatalf("outside-target control: error=%v visited=%v", err, visited)
 	}
 }
@@ -525,7 +595,7 @@ func TestCoverageContextHandoffOrchestrator(t *testing.T) {
 					body = bytes.ReplaceAll(body, []byte(`"relative":"input.go"`), []byte(`"relative":"other.go"`))
 				}
 				return os.WriteFile(req.ReportPath, body, 0600)
-			}}
+			}, omitContext: mode == "missing"}
 			dest := filepath.Join(t.TempDir(), "raw.jsonl")
 			if mode == "short-write" {
 				held, e := scope.Acquire("input.go", nil)

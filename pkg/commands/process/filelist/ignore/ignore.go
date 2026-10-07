@@ -61,14 +61,14 @@ func (fileignore *FileIgnore) Decision(
 	}
 
 	if !fileInfo.IsDir() {
-		maxSize := fileignore.config.Worker.FileSizeMaximum
-		if maxSize > 0 && fileInfo.Size() > int64(maxSize) {
+		maxSize := int64(fileutil.MaxPromisedInputFileSize)
+		configuredMax := fileignore.config.Worker.FileSizeMaximum
+		if configuredMax > 0 && int64(configuredMax) < maxSize {
+			maxSize = int64(configuredMax)
+		}
+		if fileInfo.Size() > maxSize {
 			log.Debug().Msgf("skipping file due to size: %s %s", projectPath, relativePath)
 			return "file-size", nil
-		}
-		if isMinified(filePath, fileInfo.Size(), goclocResult) {
-			log.Debug().Msgf("skipping file (suspected minified JS): %s %s", projectPath, relativePath)
-			return "minified-js", nil
 		}
 		if fileignore.skipByLanguage(filePath, goclocResult) {
 			log.Debug().Msgf("skipping file (language not in --language filter): %s %s", projectPath, relativePath)
@@ -134,32 +134,6 @@ func (fileignore *FileIgnore) skipByLanguage(fullPath string, goclocResult *gocl
 	}
 
 	return goclocResult.Files[fullPath] == nil
-}
-
-func isMinified(fullPath string, size int64, goclocResult *gocloc.Result) bool {
-	if strings.HasSuffix(fullPath, ".min.js") {
-		return true
-	}
-
-	if strings.HasSuffix(fullPath, "-min.js") {
-		return true
-	}
-
-	if strings.HasSuffix(fullPath, ".js") {
-		goclocFileResult := goclocResult.Files[fullPath]
-
-		if goclocFileResult == nil {
-			// couldn't find file
-			return false
-		}
-
-		if goclocFileResult.Blanks == 0 && goclocFileResult.Comments == 0 && size > int64(5000) {
-			// > 5KB JS file with no blank lines or comments -> assume minified
-			return true
-		}
-	}
-
-	return false
 }
 
 func isSymlink(path string) (bool, error) {
