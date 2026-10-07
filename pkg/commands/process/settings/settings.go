@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	Timeout                          = 10 * time.Minute  // "The maximum time alloted to complete the scan
+	Timeout                          = 30 * time.Minute  // "The maximum time alloted to complete the scan
 	TimeoutFileMinimum               = 5 * time.Second   // Minimum timeout assigned for scanning each file. This config superseeds timeout-second-per-bytes
 	TimeoutFileMaximum               = 30 * time.Second  // Maximum timeout assigned for scanning each file. This config superseeds timeout-second-per-bytes
 	TimeoutFileBytesPerSecond        = 1 * 1000          // 1 Kb/s minimum number of bytes per second allowed to scan a file
