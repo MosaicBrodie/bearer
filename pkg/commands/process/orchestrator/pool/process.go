@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,21 +27,34 @@ import (
 )
 
 var (
-	ErrorCrashed     = errors.New("exited unexpectedly")
-	ErrorNotSpawned  = errors.New("didn't start within expected time")
-	ErrorOutOfMemory = errors.New("exceeded memory limit")
+	ErrorCrashed       = errors.New("exited unexpectedly")
+	ErrorNotSpawned    = errors.New("didn't start within expected time")
+	ErrorOutOfMemory   = errors.New("exceeded memory limit")
+	ErrorMemoryMonitor = errors.New("worker memory monitor failed")
 )
 
+type memorySampler interface {
+	MemoryInfo() (*gopsutilprocess.MemoryInfoStat, error)
+}
+
+type memorySamplerFactory func(context.Context, int32) (memorySampler, error)
+
 type Process struct {
-	id            string
-	command       *exec.Cmd
-	context       context.Context
-	cancelContext context.CancelFunc
-	errorChannel  chan error
-	exitChannel   chan struct{}
-	client        *http.Client
-	baseURL       string
-	memoryUsage   uint64
+	id                   string
+	command              *exec.Cmd
+	context              context.Context
+	cancelContext        context.CancelFunc
+	errorChannel         chan error
+	exitChannel          chan struct{}
+	client               *http.Client
+	baseURL              string
+	memoryUsage          uint64
+	memoryMonitorDone    chan struct{}
+	memoryMonitorReady   chan error
+	memorySamplerFactory memorySamplerFactory
+	memoryMonitorErrMu   sync.Mutex
+	memoryMonitorErr     error
+	memorySampleDone     chan struct{}
 }
 
 type ProcessOptions struct {
@@ -86,6 +100,9 @@ func newProcess(options *ProcessOptions, id string) (*Process, error) {
 		exitChannel:   make(chan struct{}),
 		client:        &http.Client{Timeout: 0},
 		baseURL:       fmt.Sprintf("http://localhost:%d", port),
+		memorySamplerFactory: func(ctx context.Context, pid int32) (memorySampler, error) {
+			return gopsutilprocess.NewProcessWithContext(ctx, pid)
+		},
 	}
 
 	if err := process.start(options.config); err != nil {
@@ -107,7 +124,26 @@ func (process *Process) start(config *settings.Config) error {
 	}
 
 	go process.monitorCommand()
-	go process.monitorMemory()
+	process.memoryMonitorDone = make(chan struct{})
+	process.memoryMonitorReady = make(chan error, 1)
+	go func() {
+		defer close(process.memoryMonitorDone)
+		process.monitorMemory()
+	}()
+	select {
+	case err := <-process.memoryMonitorReady:
+		if err != nil {
+			return err
+		}
+	case <-process.context.Done():
+		if monitorErr := process.memoryMonitorError(); monitorErr != nil {
+			return monitorErr
+		}
+		return process.context.Err()
+	}
+	if err := process.context.Err(); err != nil {
+		return err
+	}
 
 	if err := process.initialize(config); err != nil {
 		if process.context.Err() != nil {
@@ -147,7 +183,7 @@ func (process *Process) monitorCommand() {
 				log.Debug().Msgf("%s stopped", process.id)
 			}
 		case <-process.exitChannel:
-			process.errorChannel <- ErrorCrashed
+			process.notifyError(ErrorCrashed)
 			return
 		}
 	}()
@@ -163,12 +199,42 @@ func (process *Process) kill() {
 }
 
 func (process *Process) monitorMemory() {
-	tick := time.NewTicker(500 * time.Millisecond)
-	monitor, err := gopsutilprocess.NewProcessWithContext(process.context, int32(process.command.Process.Pid))
+	factory := process.memorySamplerFactory
+	if factory == nil {
+		factory = func(ctx context.Context, pid int32) (memorySampler, error) {
+			return gopsutilprocess.NewProcessWithContext(ctx, pid)
+		}
+	}
+	monitor, err := factory(process.context, int32(process.command.Process.Pid))
 	if err != nil {
-		log.Debug().Msgf("failed to start memory monitor: %s", err)
+		if process.context.Err() != nil {
+			process.memoryMonitorStarted(process.context.Err())
+			return
+		}
+		log.Debug().Msg("failed to start worker memory monitor")
+		if process.failMemoryMonitor() {
+			process.memoryMonitorStarted(ErrorMemoryMonitor)
+		} else {
+			process.memoryMonitorStarted(process.context.Err())
+		}
 		return
 	}
+	if monitor == nil {
+		if process.context.Err() != nil {
+			process.memoryMonitorStarted(process.context.Err())
+			return
+		}
+		log.Debug().Msg("worker memory monitor returned no sampler")
+		if process.failMemoryMonitor() {
+			process.memoryMonitorStarted(ErrorMemoryMonitor)
+		} else {
+			process.memoryMonitorStarted(process.context.Err())
+		}
+		return
+	}
+	process.memoryMonitorStarted(nil)
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
 
 	for {
 		select {
@@ -176,22 +242,114 @@ func (process *Process) monitorMemory() {
 			log.Debug().Msgf("%s memory monitor shutting down", process.id)
 			return
 		case <-tick.C:
-			stats, err := monitor.MemoryInfo()
+			memory, err := process.sampleMemory(monitor)
 			if err != nil {
-				log.Debug().Msgf("failed to get memory usage %s", err)
-				continue
-			}
-
-			if stats.RSS > settings.MemoryMaximum {
-				process.memoryUsage = stats.RSS
-				process.errorChannel <- ErrorOutOfMemory
+				if errors.Is(err, ErrorMemoryMonitor) {
+					log.Debug().Msg("failed to sample worker memory")
+				}
 				return
 			}
 
-			if stats.RSS > settings.MemorySoftMaximum {
+			if memory.RSS > settings.MemorySoftMaximum {
 				process.reduceMemoryUsage()
 			}
 		}
+	}
+}
+
+func (process *Process) failMemoryMonitor() bool {
+	process.memoryMonitorErrMu.Lock()
+	if process.context.Err() != nil {
+		process.memoryMonitorErrMu.Unlock()
+		return false
+	}
+	process.memoryMonitorErr = ErrorMemoryMonitor
+	process.memoryMonitorErrMu.Unlock()
+	process.cancelContext()
+	process.notifyError(ErrorMemoryMonitor)
+	return true
+}
+
+// Serialize a sample with Scan's final health check. A response cannot be
+// accepted while an in-flight sample is about to report a failure or hard RSS.
+func (process *Process) sampleMemory(monitor memorySampler) (*gopsutilprocess.MemoryInfoStat, error) {
+	process.memoryMonitorErrMu.Lock()
+	if process.context.Err() != nil {
+		process.memoryMonitorErrMu.Unlock()
+		return nil, process.context.Err()
+	}
+	done := make(chan struct{})
+	process.memorySampleDone = done
+	process.memoryMonitorErrMu.Unlock()
+
+	memory, err := monitor.MemoryInfo()
+	process.memoryMonitorErrMu.Lock()
+	process.memorySampleDone = nil
+	if process.context.Err() != nil {
+		close(done)
+		process.memoryMonitorErrMu.Unlock()
+		return nil, process.context.Err()
+	}
+	if err != nil || memory == nil {
+		process.memoryMonitorErr = ErrorMemoryMonitor
+		process.cancelContext()
+		process.notifyError(ErrorMemoryMonitor)
+		close(done)
+		process.memoryMonitorErrMu.Unlock()
+		return nil, ErrorMemoryMonitor
+	}
+	if memory.RSS > settings.MemoryMaximum {
+		process.memoryUsage = memory.RSS
+		process.memoryMonitorErr = ErrorOutOfMemory
+		process.notifyError(ErrorOutOfMemory)
+		close(done)
+		process.memoryMonitorErrMu.Unlock()
+		return nil, ErrorOutOfMemory
+	}
+	close(done)
+	process.memoryMonitorErrMu.Unlock()
+	return memory, nil
+}
+
+func (process *Process) waitForMemoryHealth(ctx context.Context) error {
+	for {
+		process.memoryMonitorErrMu.Lock()
+		monitorErr := process.memoryMonitorErr
+		sampleDone := process.memorySampleDone
+		process.memoryMonitorErrMu.Unlock()
+		if monitorErr != nil {
+			return monitorErr
+		}
+		if sampleDone == nil {
+			return nil
+		}
+		select {
+		case <-sampleDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (process *Process) memoryMonitorStarted(err error) {
+	if process.memoryMonitorReady != nil {
+		process.memoryMonitorReady <- err
+	}
+}
+
+func (process *Process) memoryMonitorError() error {
+	process.memoryMonitorErrMu.Lock()
+	defer process.memoryMonitorErrMu.Unlock()
+	return process.memoryMonitorErr
+}
+
+// Monitoring and command-exit notifications share a one-slot channel. The
+// process context carries cancellation even when another terminal error is
+// already queued, so monitor goroutines must never block trying to report.
+func (process *Process) notifyError(err error) {
+	select {
+	case process.errorChannel <- err:
+	default:
 	}
 }
 
@@ -303,14 +461,26 @@ func (process *Process) Scan(scanRequest work.ProcessRequest) (*work.ProcessResp
 	}()
 	contextFailure := func() (*work.ProcessResponse, error) {
 		cancel()
+		// Stop the process monitor before waiting for its in-flight sample. This
+		// also cancels any soft-limit reduction request it may be issuing.
+		process.Close()
+		if monitorErr := process.memoryMonitorError(); monitorErr != nil {
+			return nil, monitorErr
+		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			process.Close()
 			return nil, worker.ErrorTimeoutReached
 		}
 		return nil, ctx.Err()
 	}
 	select {
 	case result := <-completed:
+		if monitorErr := process.waitForMemoryHealth(ctx); monitorErr != nil {
+			if ctx.Err() != nil {
+				return contextFailure()
+			}
+			process.Close()
+			return nil, monitorErr
+		}
 		// A response arriving with/after cancellation is never accepted as success.
 		if ctx.Err() != nil {
 			return contextFailure()
@@ -319,6 +489,9 @@ func (process *Process) Scan(scanRequest work.ProcessRequest) (*work.ProcessResp
 	case err, ok := <-process.errorChannel:
 		cancel()
 		process.Close()
+		if monitorErr := process.memoryMonitorError(); monitorErr != nil {
+			return nil, monitorErr
+		}
 		if !ok || err == nil {
 			return nil, ErrorCrashed
 		}
@@ -408,6 +581,9 @@ func (process *Process) initializationResponse(response *http.Response) (bool, e
 func (process *Process) Close() {
 	process.cancelContext()
 	<-process.exitChannel
+	if process.memoryMonitorDone != nil {
+		<-process.memoryMonitorDone
+	}
 }
 
 func allocatePort() (int, error) {
